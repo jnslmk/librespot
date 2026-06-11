@@ -66,6 +66,18 @@ from librespot.structure import Closeable
 from librespot.structure import MessageListener
 from librespot.structure import RequestListener
 from librespot.structure import SubListener
+def _read_varint(data: bytes, pos: int) -> typing.Tuple[int | None, int]:
+    """Read a protobuf varint from data at pos. Returns (value, new_pos) or (None, pos) on error."""
+    result = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        shift += 7
+        if not (b & 0x80):
+            return result, pos
+    return None, pos
 
 
 class ApiClient(Closeable):
@@ -83,88 +95,47 @@ class ApiClient(Closeable):
         self,
         method: str,
         suffix: str,
-        headers: typing.Union[None, CaseInsensitiveDict[str, str]],
+        headers: typing.Union[None, typing.Dict[str, str]],
         body: typing.Union[None, bytes],
-        url: typing.Union[None, str],
     ) -> requests.PreparedRequest:
-        """
-
-        :param method: str:
-        :param suffix: str:
-        :param headers: typing.Union[None:
-        :param CaseInsensitiveDict[str:
-        :param str]]:
-        :param body: typing.Union[None:
-        :param bytes]:
-        :param url: typing.Union[None:
-        :param str]:
-
-        """
         if self.__client_token_str is None:
             resp = self.__client_token()
             self.__client_token_str = resp.granted_token.token
-            self.logger.debug("Updated client token: {}".format(
-                self.__client_token_str))
+            self.logger.debug("Updated client token: {}".format(self.__client_token_str))
 
-        if url is None:
-            url = self.__base_url + suffix
+        request = requests.PreparedRequest()
+        request.method = method
+        request.data = body
+        request.headers = headers.copy() if headers else {}
+        # Use streaming scope for metadata requests to get audio file IDs
+        if suffix.startswith("/metadata/4/"):
+            scope = "playlist-read streaming"
         else:
-            url = url + suffix
+            scope = "playlist-read"
+        request.headers["Authorization"] = "Bearer {}".format(
+            self.__session.tokens().get(scope)
+        )
+        request.headers["client-token"] = self.__client_token_str
 
-        if headers is None:
-            headers = CaseInsensitiveDict()
-        headers["Authorization"] = "Bearer {}".format(
-            self.__session.tokens().get("playlist-read"))
-        headers["client-token"] = self.__client_token_str
+        # Force metadata requests to use a specific host
+        if suffix.startswith("/metadata/4/"):
+            base_url = "https://spclient.wg.spotify.com"
+        else:
+            base_url = self.__base_url
 
-        request = requests.Request(method, url, headers=headers, data=body)
-
-        return request.prepare()
+        request.url = base_url + suffix
+        return request
 
     def send(
         self,
         method: str,
         suffix: str,
-        headers: typing.Union[None, CaseInsensitiveDict[str, str]],
+        headers: typing.Union[None, typing.Dict[str, str]],
         body: typing.Union[None, bytes],
     ) -> requests.Response:
-        """
-
-        :param method: str:
-        :param suffix: str:
-        :param headers: typing.Union[None:
-        :param CaseInsensitiveDict[str:
-        :param str]]:
-        :param body: typing.Union[None:
-        :param bytes]:
-
-        """
         response = self.__session.client().send(
-            self.build_request(method, suffix, headers, body, None))
-        return response
-
-    def sendToUrl(
-        self,
-        method: str,
-        url: str,
-        suffix: str,
-        headers: typing.Union[None, CaseInsensitiveDict[str, str]],
-        body: typing.Union[None, bytes],
-    ) -> requests.Response:
-        """
-
-        :param method: str:
-        :param url: str:
-        :param suffix: str:
-        :param headers: typing.Union[None:
-        :param CaseInsensitiveDict[str:
-        :param str]]:
-        :param body: typing.Union[None:
-        :param bytes]:
-
-        """
-        response = self.__session.client().send(
-            self.build_request(method, suffix, headers, body, url))
+            self.build_request(method, suffix, headers, body)
+        )
         return response
 
     def put_connect_state(self, connection_id: str,
@@ -192,91 +163,129 @@ class ApiClient(Closeable):
             self.logger.warning("PUT state returned {}. headers: {}".format(
                 response.status_code, response.headers))
 
-    def get_ext_metadata(self, extension_kind: ExtensionKind, uri: str):
-        headers = CaseInsensitiveDict({"content-type": "application/x-protobuf"})
-        req = EntityRequest(entity_uri=uri, query=[ExtensionQuery(extension_kind=extension_kind),])
-
-        response = self.send("POST", "/extended-metadata/v0/extended-metadata",
-                             headers, BatchedEntityRequest(entity_request=[req,]).SerializeToString())
+    def get_metadata_4_track(self, track: TrackId) -> Metadata.Track:
+        response = self.send("GET", "/metadata/4/track/{}".format(track.hex_id()), None, None)
         ApiClient.StatusCodeException.check_status(response)
-
         body = response.content
         if body is None:
-            raise ConnectionError("Extended Metadata request failed: No response body")
-
-        proto = BatchedExtensionResponse()
+            raise RuntimeError()
+        proto = Metadata.Track()
         proto.ParseFromString(body)
-        entityextd = proto.extended_metadata.pop().extension_data.pop()
-        if entityextd.header.status_code != 200:
-            raise ConnectionError("Extended Metadata request failed: Status code {}".format(entityextd.header.status_code))
-        mdb: bytes = entityextd.extension_data.value
-        return mdb
 
-    def get_metadata_4_track(self, track: TrackId) -> Metadata.Track:
-        """
+        # Spotify moved audio file IDs from field 12 (file) to field 24.
+        # Extract them so the rest of the codebase works unchanged.
+        if len(proto.file) == 0:
+            self._extract_audio_files_from_wire(proto, body)
 
-        :param track: TrackId:
+        return proto
 
-        """
-        mdb = self.get_ext_metadata(ExtensionKind.TRACK_V4, track.to_spotify_uri())
-        md = Metadata.Track()
-        md.ParseFromString(mdb)
-        return md
+    @staticmethod
+    def _extract_audio_files_from_wire(proto: Metadata.Track, raw: bytes) -> None:
+        """Parse raw protobuf bytes to extract AudioFile entries from unknown fields
+        and populate proto.file when the schema's field 12 is empty."""
+        pos = 0
+        while pos < len(raw):
+            # Read field tag (varint)
+            tag, pos = _read_varint(raw, pos)
+            if tag is None:
+                break
+            field_num = tag >> 3
+            wire_type = tag & 0x7
+
+            if wire_type == 2:  # Length-delimited
+                length, pos = _read_varint(raw, pos)
+                if length is None:
+                    break
+                value = raw[pos:pos + length]
+                pos += length
+
+                # Field 24 contains AudioFile entries directly
+                if field_num == 24:
+                    af = Metadata.AudioFile()
+                    try:
+                        af.ParseFromString(value)
+                        if af.file_id:
+                            proto.file.append(af)
+                    except Exception:
+                        pass
+                # Field 41 may contain nested AudioFile (field 1 → AudioFile)
+                elif field_num == 41:
+                    inner_pos = 0
+                    while inner_pos < len(value):
+                        inner_tag, inner_pos = _read_varint(value, inner_pos)
+                        if inner_tag is None:
+                            break
+                        inner_wire = inner_tag & 0x7
+                        if inner_wire == 2:
+                            inner_len, inner_pos = _read_varint(value, inner_pos)
+                            if inner_len is None:
+                                break
+                            inner_val = value[inner_pos:inner_pos + inner_len]
+                            inner_pos += inner_len
+                            af = Metadata.AudioFile()
+                            try:
+                                af.ParseFromString(inner_val)
+                                if af.file_id:
+                                    proto.file.append(af)
+                            except Exception:
+                                pass
+                        elif inner_wire == 0:
+                            _, inner_pos = _read_varint(value, inner_pos)
+                        elif inner_wire == 1:
+                            inner_pos += 8
+                        elif inner_wire == 5:
+                            inner_pos += 4
+            elif wire_type == 0:  # Varint
+                _, pos = _read_varint(raw, pos)
+            elif wire_type == 1:  # 64-bit
+                pos += 8
+            elif wire_type == 5:  # 32-bit
+                pos += 4
+            else:
+                break
 
     def get_metadata_4_episode(self, episode: EpisodeId) -> Metadata.Episode:
-        """
-
-        :param episode: EpisodeId:
-
-        """
-        mdb = self.get_ext_metadata(ExtensionKind.EPISODE_V4, episode.to_spotify_uri())
-        md = Metadata.Episode()
-        md.ParseFromString(mdb)
-        return md
+        response = self.send("GET", "/metadata/4/episode/{}".format(episode.hex_id()), None, None)
+        ApiClient.StatusCodeException.check_status(response)
+        body = response.content
+        if body is None:
+            raise IOError()
+        proto = Metadata.Episode()
+        proto.ParseFromString(body)
+        return proto
 
     def get_metadata_4_album(self, album: AlbumId) -> Metadata.Album:
-        """
-
-        :param album: AlbumId:
-
-        """
-        mdb = self.get_ext_metadata(ExtensionKind.ALBUM_V4, album.to_spotify_uri())
-        md = Metadata.Album()
-        md.ParseFromString(mdb)
-        return md
+        response = self.send("GET", "/metadata/4/album/{}".format(album.hex_id()), None, None)
+        ApiClient.StatusCodeException.check_status(response)
+        body = response.content
+        if body is None:
+            raise IOError()
+        proto = Metadata.Album()
+        proto.ParseFromString(body)
+        return proto
 
     def get_metadata_4_artist(self, artist: ArtistId) -> Metadata.Artist:
-        """
-
-        :param artist: ArtistId:
-
-        """
-        mdb = self.get_ext_metadata(ExtensionKind.ARTIST_V4, artist.to_spotify_uri())
-        md = Metadata.Artist()
-        md.ParseFromString(mdb)
-        return md
+        response = self.send("GET", "/metadata/4/artist/{}".format(artist.hex_id()), None, None)
+        ApiClient.StatusCodeException.check_status(response)
+        body = response.content
+        if body is None:
+            raise IOError()
+        proto = Metadata.Artist()
+        proto.ParseFromString(body)
+        return proto
 
     def get_metadata_4_show(self, show: ShowId) -> Metadata.Show:
-        """
+        response = self.send("GET", "/metadata/4/show/{}".format(show.hex_id()), None, None)
+        ApiClient.StatusCodeException.check_status(response)
+        body = response.content
+        if body is None:
+            raise IOError()
+        proto = Metadata.Show()
+        proto.ParseFromString(body)
+        return proto
 
-        :param show: ShowId:
-
-        """
-        mdb = self.get_ext_metadata(ExtensionKind.SHOW_V4, show.to_spotify_uri())
-        md = Metadata.Show()
-        md.ParseFromString(mdb)
-        return md
-
-    def get_playlist(self,
-                     _id: PlaylistId) -> Playlist4External.SelectedListContent:
-        """
-
-        :param _id: PlaylistId:
-
-        """
-        response = self.send("GET",
-                             "/playlist/v2/playlist/{}".format(_id.id()), None,
-                             None)
+    def get_playlist(self, _id: PlaylistId) -> Playlist4External.SelectedListContent:
+        response = self.send("GET", "/playlist/v2/playlist/{}".format(_id.id()), None, None)
         ApiClient.StatusCodeException.check_status(response)
         body = response.content
         if body is None:
@@ -295,8 +304,7 @@ class ApiClient(Closeable):
 
     def __client_token(self):
         proto_req = ClientToken.ClientTokenRequest(
-            request_type=ClientToken.ClientTokenRequestType.
-            REQUEST_CLIENT_DATA_REQUEST,
+            request_type=ClientToken.ClientTokenRequestType.REQUEST_CLIENT_DATA_REQUEST,
             client_data=ClientToken.ClientDataRequest(
                 client_id=MercuryRequests.keymaster_client_id,
                 client_version=Version.version_name,
@@ -311,7 +319,8 @@ class ApiClient(Closeable):
                             something7=332,
                             something8=33404,
                             something10=True,
-                        ), ),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -319,10 +328,10 @@ class ApiClient(Closeable):
         resp = requests.post(
             "https://clienttoken.spotify.com/v1/clienttoken",
             proto_req.SerializeToString(),
-            headers=CaseInsensitiveDict({
+            headers={
                 "Accept": "application/x-protobuf",
                 "Content-Encoding": "",
-            }),
+            },
         )
 
         ApiClient.StatusCodeException.check_status(resp)
@@ -881,6 +890,7 @@ class MessageType(enum.Enum):
 
 class Session(Closeable, MessageListener, SubListener):
     """ """
+    CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"  # Spotify client ID for librespot
     cipher_pair: typing.Union[CipherPair, None]
     country_code: str = "EN"
     connection: typing.Union[ConnectionHolder, None]
@@ -923,6 +933,8 @@ class Session(Closeable, MessageListener, SubListener):
     __stored_str: str = ""
     __token_provider: typing.Union[TokenProvider, None]
     __user_attributes = {}
+    __login5_access_token: typing.Union[str, None] = None
+    __login5_token_expiry: typing.Union[int, None] = None
 
     def __init__(self, inner: Inner, address: str) -> None:
         self.__client = Session.create_client(inner.conf)
@@ -962,6 +974,10 @@ class Session(Closeable, MessageListener, SubListener):
 
         """
         self.__authenticate_partial(credential, False)
+
+        # Try Login5 authentication for access token
+        self.__authenticate_login5(credential)
+
         with self.__auth_lock:
             self.__mercury_client = MercuryClient(self)
             self.__token_provider = TokenProvider(self)
@@ -974,7 +990,7 @@ class Session(Closeable, MessageListener, SubListener):
             self.__dealer_client = DealerClient(self)
             self.__search = SearchManager(self)
             self.__event_service = EventService(self)
-            self.__auth_lock_bool = False
+            self.__auth_lock_bool = True
             self.__auth_lock.notify_all()
         self.dealer().connect()
         self.logger.info("Authenticated as {}!".format(
@@ -982,6 +998,65 @@ class Session(Closeable, MessageListener, SubListener):
         self.mercury().interested_in("spotify:user:attributes:update", self)
         self.dealer().add_message_listener(
             self, ["hm://connect-state/v1/connect/logout"])
+    def __authenticate_login5(self, credential: Authentication.LoginCredentials) -> None:
+        """Authenticate using Login5 to get access token"""
+        try:
+            # Build Login5 request
+            login5_request = Login5.LoginRequest()
+            
+            # Set client info
+            login5_request.client_info.client_id = Session.CLIENT_ID
+            login5_request.client_info.device_id = self.__inner.device_id
+            
+            # Set stored credential from APWelcome
+            if hasattr(self, '_Session__ap_welcome') and self.__ap_welcome:
+                stored_cred = Login5Credentials.StoredCredential()
+                stored_cred.username = self.__ap_welcome.canonical_username
+                stored_cred.data = self.__ap_welcome.reusable_auth_credentials
+                login5_request.stored_credential.CopyFrom(stored_cred)
+                
+                # Send Login5 request
+                login5_url = "https://login5.spotify.com/v3/login"
+                headers = {
+                    "Content-Type": "application/x-protobuf",
+                    "Accept": "application/x-protobuf"
+                }
+                
+                response = requests.post(
+                    login5_url,
+                    data=login5_request.SerializeToString(),
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    login5_response = Login5.LoginResponse()
+                    login5_response.ParseFromString(response.content)
+                    
+                    if login5_response.HasField('ok'):
+                        self.__login5_access_token = login5_response.ok.access_token
+                        self.__login5_token_expiry = int(time.time()) + login5_response.ok.access_token_expires_in
+                        self.logger.info("Login5 authentication successful, got access token")
+                    else:
+                        error_msg = "Login5 authentication failed"
+                        if login5_response.HasField('error'):
+                            error_msg += f": {login5_response.error}"
+                        self.logger.error(error_msg)
+                        # Don't raise exception here, as the session can still work with some limitations
+                else:
+                    self.logger.error("Login5 request failed with status: {}".format(response.status_code))
+                    # Don't raise exception here, as the session can still work with some limitations
+        except Exception as e:
+            self.logger.error("Failed to authenticate with Login5: {}".format(e))
+            # Don't raise exception here, as the session can still work with some limitations
+    
+    def get_login5_token(self) -> typing.Union[str, None]:
+        """Get the Login5 access token if available and not expired"""
+        if self.__login5_access_token and self.__login5_token_expiry:
+            if int(time.time()) < self.__login5_token_expiry - 60:  # 60 second buffer
+                return self.__login5_access_token
+            else:
+                self.logger.debug("Login5 token expired, need to re-authenticate")
+        return None
 
     def cache(self) -> CacheManager:
         """ """
@@ -1393,7 +1468,7 @@ class Session(Closeable, MessageListener, SubListener):
         """ """
         conf = None
         device_id = None
-        device_name = "librespot-python"
+        device_name = "librespot-spotizerr"
         device_type = Connect.DeviceType.COMPUTER
         preferred_locale = "en"
 
@@ -2276,7 +2351,7 @@ class TokenProvider:
     __tokens: typing.List[StoredToken] = []
 
     def __init__(self, session: Session):
-        self.__session = session
+        self._session = session
 
     def find_token_with_all_scopes(
             self, scopes: typing.List[str]) -> typing.Union[StoredToken, None]:
@@ -2304,63 +2379,91 @@ class TokenProvider:
         :param *scopes:
 
         """
-        scopes = list(scopes)
+        # Flatten: scope args may be space-separated ("playlist-read streaming")
+        raw_scopes = list(scopes)
+        scopes = []
+        for s in raw_scopes:
+            scopes.extend(s.split())
         if len(scopes) == 0:
             raise RuntimeError("The token doesn't have any scope")
 
+        # For requests needing streaming scope, try keymaster first
+        # (Login5 tokens may not include streaming scope)
+        needs_streaming = "streaming" in scopes
+        if needs_streaming:
+            token = self.find_token_with_all_scopes(scopes)
+            if token is not None and not token.expired():
+                self.logger.debug("Using cached token for scopes: {}".format(scopes))
+                return token
+
+            # Request from keymaster endpoint via Mercury
+            try:
+                from deezspot.libutils.mercury import MercuryRequests
+            except ImportError:
+                try:
+                    from librespot.mercury import MercuryRequests
+                except ImportError:
+                    MercuryRequests = None
+
+            if MercuryRequests is not None:
+                try:
+                    response = self._session.mercury().send_sync_json(
+                        MercuryRequests.request_token(
+                            self._session.device_id(), ",".join(scopes),
+                        ),
+                    )
+                    token = TokenProvider.StoredToken(response)
+                    self.logger.debug(
+                        "Obtained token from keymaster for scopes: {}, token: {}".format(
+                            scopes, token,
+                        ),
+                    )
+                    self.__tokens.append(token)
+                    return token
+                except Exception as e:
+                    self.logger.warning(
+                        "Keymaster token request failed: {}".format(e),
+                    )
+
+        # Use Login5 token (sufficient for non-streaming scopes)
+        login5_token = self._session.get_login5_token()
+        if login5_token:
+            # Create a StoredToken-compatible object using Login5 token
+            login5_stored_token = TokenProvider.Login5StoredToken(login5_token, scopes)
+            self.logger.debug("Using Login5 access token for scopes: {}".format(scopes))
+            return login5_stored_token
+
+        # Check existing tokens
         token = self.find_token_with_all_scopes(scopes)
         if token is not None:
             if token.expired():
                 self.__tokens.remove(token)
-                self.logger.debug("Login5 token expired, need to re-authenticate")
             else:
                 return token
 
-        token = self.login5(scopes)
-        if token is not None:
-            self.__tokens.append(token)
-            self.logger.debug("Using Login5 access token for scopes: {}".format(scopes))
-        return token
+        # No valid token available
+        raise RuntimeError("Unable to obtain access token. Login5 authentication may have failed.")
 
-    def login5(self, scopes: typing.List[str]) -> typing.Union[StoredToken, None]:
-        """Submit Login5 request for a fresh access token"""
+    class Login5StoredToken:
+        """StoredToken-compatible wrapper for Login5 access tokens"""
+        access_token: str
+        scopes: typing.List[str]
         
-        if self.__session.ap_welcome():
-            login5_request = Login5.LoginRequest()
-            login5_request.client_info.client_id = MercuryRequests.keymaster_client_id
-            login5_request.client_info.device_id = self.__session.device_id()
-
-            stored_cred = Login5Credentials.StoredCredential()
-            stored_cred.username = self.__session.username()
-            stored_cred.data = self.__session.ap_welcome().reusable_auth_credentials
-            login5_request.stored_credential.CopyFrom(stored_cred)
-
-            response = requests.post(
-                "https://login5.spotify.com/v3/login",
-                data=login5_request.SerializeToString(),
-                headers=CaseInsensitiveDict({
-                    "Content-Type": "application/x-protobuf",
-                    "Accept": "application/x-protobuf"
-                    }))
-
-            if response.status_code == 200:
-                login5_response = Login5.LoginResponse()
-                login5_response.ParseFromString(response.content)
-
-                if login5_response.HasField('ok'):
-                    self.logger.info("Login5 authentication successful, got access token".format(login5_response.ok.access_token))
-                    token = TokenProvider.StoredToken({
-                        "expiresIn": login5_response.ok.access_token_expires_in, # approximately one hour
-                        "accessToken": login5_response.ok.access_token,
-                        "scope": scopes
-                    })
-                    return token 
-                else:
-                    self.logger.warning("Login5 authentication failed: {}".format(login5_response.error))
-            else:
-                self.logger.warning("Login5 request failed with status: {}".format(response.status_code))
-        else:
-            self.logger.error("Login5 authentication failed: No APWelcome found")
+        def __init__(self, access_token: str, scopes: typing.List[str]):
+            self.access_token = access_token
+            self.scopes = scopes
+        
+        def expired(self) -> bool:
+            """Login5 tokens are managed by Session, so delegate expiry check"""
+            return False  # Session handles expiry
+        
+        def has_scope(self, scope: str) -> bool:
+            """Login5 tokens are general-purpose, assume they have all scopes"""
+            return True
+        
+        def has_scopes(self, sc: typing.List[str]) -> bool:
+            """Login5 tokens are general-purpose, assume they have all scopes"""
+            return True
 
     class StoredToken:
         """ """
